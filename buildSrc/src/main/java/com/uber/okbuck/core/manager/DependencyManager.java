@@ -1,8 +1,5 @@
 package com.uber.okbuck.core.manager;
 
-import static com.uber.okbuck.core.dependency.OResolvedDependency.AAR;
-import static com.uber.okbuck.core.dependency.OResolvedDependency.JAR;
-
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -30,26 +27,36 @@ import com.uber.okbuck.extension.JetifierExtension;
 import com.uber.okbuck.extension.OkBuckExtension;
 import com.uber.okbuck.template.common.BazelFunctionRule;
 import com.uber.okbuck.template.core.Rule;
-import java.io.File;
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
+import groovy.lang.GString;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ExternalDependency;
 import org.gradle.api.artifacts.ResolvedConfiguration;
 import org.gradle.api.artifacts.ResolvedDependency;
+import org.gradle.api.internal.artifacts.dependencies.DefaultExternalModuleDependency;
+import org.gradle.internal.extensibility.DefaultExtraPropertiesExtension;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static com.uber.okbuck.core.dependency.OResolvedDependency.AAR;
+import static com.uber.okbuck.core.dependency.OResolvedDependency.JAR;
 
 public class DependencyManager {
 
@@ -93,7 +100,112 @@ public class DependencyManager {
     }
   }
 
+  private static String yamlIdent(int n) {
+    return StringUtils.repeat(StringUtils.SPACE, n * 2);
+  }
+
+  private static boolean containsIn(Collection<ExternalDependency> deps, ExternalDependency externalDependency) {
+    for (ExternalDependency externalModuleDependency : deps) {
+      if (StringUtils.equals(externalModuleDependency.getGroup(), externalDependency.getGroup()) &&
+          StringUtils.equals(externalModuleDependency.getName(), externalDependency.getName()) &&
+          StringUtils.equals(externalModuleDependency.getVersion(), externalDependency.getVersion())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static List<ExternalDependency> extractDependency(Object dep){
+    List<ExternalDependency> result = new ArrayList<>();
+    if (dep instanceof String || dep instanceof GString) {
+      String[] tokens = dep.toString().split(":");
+      if (tokens != null && tokens.length == 3) {
+        result.add(new DefaultExternalModuleDependency(tokens[0], tokens[1], tokens[2], "default"));
+      }
+    } else if (dep instanceof ExternalDependency) {
+      result.add((ExternalDependency) dep);
+    } else if (dep instanceof Collection) {
+      for (Object j : (Collection) dep) {
+        result.addAll(extractDependency(j));
+      }
+    }
+    return result;
+  }
+  private Collection<ExternalDependency> getAptDeps() {
+    return ((Map<String, Object>) ((DefaultExtraPropertiesExtension) project.getExtensions().getByName("ext")).get(
+        "apt")).values()
+        .stream().flatMap(i -> {
+          List<ExternalDependency> list = extractDependency(i);
+          return list.stream();
+        })
+        .collect(Collectors.toList());
+  }
+
+  private void printDepsYaml() {
+    Collection<ExternalDependency> fixedDeps = (Collection<ExternalDependency>) ((DefaultExtraPropertiesExtension) project.getExtensions()
+        .getByName("ext")).get("fixed_deps");
+    Collection<ExternalDependency> aptDeps = getAptDeps();
+
+    Map<String, List<ExternalDependency>> rawDepsMap =
+        rawDependencies
+            .stream()
+            .collect(Collectors.groupingBy(Dependency::getGroup));
+
+    rawDepsMap.keySet().stream().sorted().forEach(group -> {
+      System.out.println("");
+      System.out.println(group + ":");
+
+      List<ExternalDependency> versionDeps = rawDepsMap.get(group);
+
+      Map<String, List<ExternalDependency>> dMap = Preconditions.checkNotNull(versionDeps).stream()
+          .collect(Collectors.groupingBy(Dependency::getVersion));
+
+      AtomicInteger count = new AtomicInteger(0);
+      Preconditions.checkNotNull(dMap).keySet().stream().sorted(Comparator.reverseOrder()).forEach(version -> {
+
+        System.out.println(yamlIdent(1) + version + ":");
+        if (count.incrementAndGet() == 1) {
+          System.out.println(yamlIdent(2) + "default: true");
+        }
+
+        List<ExternalDependency> deps = Preconditions.checkNotNull(dMap.get(version));
+        Map<String, DependencyModel> dependenciesMap = new HashMap<>();
+
+        Preconditions.checkNotNull(deps).stream().forEach(dep -> {
+          String identifier = dep.toString();
+          DependencyModel dependency = dependenciesMap.getOrDefault(identifier, DependencyModel.get(dep));
+          dependency.update(dep);
+          dependenciesMap.put(identifier, dependency);
+        });
+
+        dependenciesMap.keySet().stream().sorted()
+            .map(identifier -> {
+              DependencyModel dependency = Preconditions.checkNotNull(dependenciesMap.get(identifier));
+              System.out.println(yamlIdent(2) + dependency.getName() + ":");
+
+              if (containsIn(aptDeps, dependency.externalDependency)) {
+                System.out.println(yamlIdent(3) + "apt: true");
+              }
+
+              if (containsIn(fixedDeps, dependency.externalDependency)) {
+                System.out.println(yamlIdent(3) + "force: true");
+              }
+              if (dependency.excludes.size() > 0) {
+                System.out.println(yamlIdent(3) + "excludes:");
+                for (String exclude : dependency.excludes) {
+                  System.out.println(yamlIdent(4) + "- " + exclude);
+                }
+              }
+              return identifier;
+            })
+            .forEach(i -> {});
+
+      });
+    });
+  }
+
   public void resolveCurrentRawDeps() {
+
     if (!externalDependenciesExtension.resoleOnlyThirdParty()) {
       return;
     }
@@ -101,7 +213,9 @@ public class DependencyManager {
     Map<String, List<ExternalDependency>> rawDepsMap =
         rawDependencies
             .stream()
-            .collect(Collectors.groupingBy(i -> i.getGroup() + "--" + i.getVersion()));
+            .collect(Collectors.groupingBy(Dependency::getGroup));
+
+    printDepsYaml();
 
     List<Project> allProjects = new ArrayList<>(project.getAllprojects());
     int numberOfChunks = allProjects.size();
